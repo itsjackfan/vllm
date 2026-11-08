@@ -1016,6 +1016,25 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
+class DuoForDiffusionConfig(VerifyAndUpdateConfig):
+    @classmethod
+    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        """Duo denoises one canvas = the whole model_length per request (see models/duo.py). Its attention never
+        reads the KV cache, so the backend only has to build metadata: TRITON_ATTN accepts spec-decode-shaped
+        (canvas-length) queries on every GPU."""
+        from vllm.config.diffusion import DiffusionConfig
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        hf_config = vllm_config.model_config.hf_config
+        if vllm_config.diffusion_config is None:
+            vllm_config.diffusion_config = DiffusionConfig(
+                canvas_length=hf_config.canvas_length,
+                max_denoising_steps=hf_config.max_denoising_steps,
+            )
+        if vllm_config.attention_config.backend is None:
+            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
@@ -1024,6 +1043,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "DeepseekV41ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
+    "DUO": DuoForDiffusionConfig,
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,
