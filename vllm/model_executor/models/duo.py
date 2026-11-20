@@ -126,7 +126,9 @@ class DuoForDiffusion(nn.Module):
         self.register_buffer("inv_freq", 1.0 / 10000 ** (torch.arange(0, K, 2, dtype=torch.float32) / K), False)
         # Never called: registers one (small) KV cache layer so the scheduler / runner KV path works unchanged.
         # Duo recomputes the full canvas every step and attends within it only (DuoBlock.forward).
-        self.kv_anchor = Attention(H, K, K**-0.5, cache_config=vllm_config.cache_config, prefix=f"{prefix}.kv_anchor")
+        # Lives on block 0: vLLM requires exactly one layer index in every attention layer name.
+        self.blocks[0].kv_anchor = Attention(H, K, K**-0.5, cache_config=vllm_config.cache_config,
+                                             prefix="blocks.0.kv_anchor")
 
     def embed_input_ids(self, input_ids):
         return self.vocab_embed.embedding[input_ids]
