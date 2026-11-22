@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
+from torch.profiler import record_function  # region labels for the parent repo's src/profiling.py
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention import Attention
@@ -75,16 +76,21 @@ class DuoBlock(nn.Module):
     def forward(self, x_ND, cos_NK, sin_NK, c_NC, seg_lens):
         """x_ND: fp32 residual stream (the reference adds bf16 branches onto an fp32 stream under autocast)."""
         dt = self.attn_qkv.weight.dtype
-        shift1, scale1, gate1, shift2, scale2, gate2 = self.adaLN_modulation(c_NC.to(dt)).float().chunk(6, -1)
-        h_ND = (layer_norm(x_ND, self.norm1.weight) * (1 + scale1) + shift1).to(dt)
-        q, k, v = rearrange(self.attn_qkv(h_ND), "n (three h k) -> three n h k", three=3, h=self.n_heads)
-        q, k = rotary(q, cos_NK, sin_NK).to(dt), rotary(k, cos_NK, sin_NK).to(dt)
-        # NOTE: one SDPA per request canvas (exact, no cache). Baseline for a fused varlen kernel.
-        a_NHK = torch.cat([
-            F.scaled_dot_product_attention(qs.transpose(0, 1), ks.transpose(0, 1), vs.transpose(0, 1)).transpose(0, 1)
-            for qs, ks, vs in zip(q.split(seg_lens), k.split(seg_lens), v.split(seg_lens))])
-        x_ND = x_ND + gate1 * self.attn_out(rearrange(a_NHK, "n h k -> n (h k)")).float()
-        return x_ND + gate2 * self.mlp((layer_norm(x_ND, self.norm2.weight) * (1 + scale2) + shift2).to(dt)).float()
+        with record_function("adaln"):
+            shift1, scale1, gate1, shift2, scale2, gate2 = self.adaLN_modulation(c_NC.to(dt)).float().chunk(6, -1)
+            h_ND = (layer_norm(x_ND, self.norm1.weight) * (1 + scale1) + shift1).to(dt)
+        with record_function("attention"):
+            q, k, v = rearrange(self.attn_qkv(h_ND), "n (three h k) -> three n h k", three=3, h=self.n_heads)
+            q, k = rotary(q, cos_NK, sin_NK).to(dt), rotary(k, cos_NK, sin_NK).to(dt)
+            # NOTE: one SDPA per request canvas (exact, no cache). Baseline for a fused varlen kernel.
+            a_NHK = torch.cat([
+                F.scaled_dot_product_attention(qs.transpose(0, 1), ks.transpose(0, 1), vs.transpose(0, 1))
+                .transpose(0, 1) for qs, ks, vs in zip(q.split(seg_lens), k.split(seg_lens), v.split(seg_lens))])
+            x_ND = x_ND + gate1 * self.attn_out(rearrange(a_NHK, "n h k -> n (h k)")).float()
+        with record_function("adaln"):
+            h_ND = (layer_norm(x_ND, self.norm2.weight) * (1 + scale2) + shift2).to(dt)
+        with record_function("mlp"):
+            return x_ND + gate2 * self.mlp(h_ND).float()
 
 
 class DuoFinalLayer(nn.Module):
@@ -94,6 +100,7 @@ class DuoFinalLayer(nn.Module):
         self.linear = nn.Linear(dim, vocab_size)
         self.adaLN_modulation = nn.Linear(cond_dim, 2 * dim)
 
+    @record_function("output_proj")
     def pre_logits(self, x_ND, c_NC):
         dt = self.linear.weight.dtype
         shift, scale = self.adaLN_modulation(c_NC.to(dt)).float().chunk(2, -1)
@@ -143,6 +150,7 @@ class DuoForDiffusion(nn.Module):
             x_ND = block(x_ND, cos_NK, sin_NK, c_NC, seg_lens)
         return self.output_layer.pre_logits(x_ND, c_NC)
 
+    @record_function("output_proj")
     def compute_logits(self, hidden_states):
         return self.output_layer.linear(hidden_states).float()
 
@@ -255,6 +263,7 @@ class DuoSampler:
         self.sampling_states.apply_staged_writes()
         self.logprob_token_ids_state.apply_staged_writes()
 
+    @record_function("sampling")
     def _denoise(self, logits_NV, slots_n):
         """One ancestral step for n canvases -> (new canvas [n, L], emit [n])."""
         st = self.states
